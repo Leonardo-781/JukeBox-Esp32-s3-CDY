@@ -1,0 +1,41 @@
+PONTE SPOTIFY -> JUKEBOX ESP32-S3
+==================================
+
+O que faz: cria um aparelho "Jukebox" no Spotify. Voce escolhe a musica
+no app (celular/PC), toca em Dispositivos -> Jukebox e o som sai no
+ESP32-S3 + MAX98357A.
+
+REQUISITOS
+- Spotify PREMIUM (sem Premium o Spotify Connect nao funciona)
+- PC e ESP32 na mesma rede Wi-Fi (sua rede local 2.4GHz)
+- PC com IP 192.168.0.105 (ou troque SERVER_HOST no sketch)
+- Python 3.9+
+
+1) INSTALAR O LIBRESPOT (so uma vez)
+   Nao existe .exe oficial; ele e compilado com o Rust:
+   a. Instale o Rust: https://rustup.rs  (o instalador pede o
+      "Visual Studio C++ Build Tools" - aceite). Precisa de uns 5-8 GB livres.
+   b. Abra um terminal novo e rode:
+         cargo install librespot
+   c. Ele fica em  %USERPROFILE%\.cargo\bin\librespot.exe
+      (a ponte acha sozinha; ou copie o .exe para esta pasta)
+
+2) RODAR
+   - Dois cliques em iniciar_ponte.bat
+   - Se o Windows Firewall perguntar, PERMITA em "Redes privadas"
+     (senao o celular nao enxerga o aparelho Jukebox)
+   - Ligue o ESP32 com o sketch Teste_MAX98357A_S3
+
+3) TOCAR
+   - Celular no mesmo Wi-Fi -> Spotify -> qualquer musica
+   - Icone de dispositivos (alto-falante) -> "Jukebox"
+   - O volume do app do Spotify controla o volume do ESP
+
+DICAS
+- No Serial Monitor do ESP aparece:
+    [STREAM] 86 KB/s | buffer ~700 ms | tocando
+  86 KB/s e o normal. Se "engasgos" sobe muito, o Wi-Fi esta fraco.
+- O botao BOOT / comandos p, n, d usam o app.py na porta 3003.
+  O app.py desta pasta roda na 5000; para eles funcionarem rode o app.py
+  na 3003 (e ajuste o redirect_uri no painel do Spotify) ou ignore -
+  escolher musica pelo app do Spotify NAO depende disso.

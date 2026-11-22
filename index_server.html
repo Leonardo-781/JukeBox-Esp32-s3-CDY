@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Vitrola Jukebox — Servidor STI</title>
+  <style>
+    :root {
+      --bg: #0f1216;
+      --card: #181c22;
+      --edge: #28303b;
+      --green: #1db954;
+      --amber: #f5a623;
+      --text: #f3f5f8;
+      --muted: #939eae;
+      --danger: #e5534b;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: system-ui, -apple-system, sans-serif; }
+    body { background: var(--bg); color: var(--text); padding: 24px; max-width: 960px; margin: 0 auto; }
+    header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; border-bottom: 1px solid var(--edge); padding-bottom: 16px; }
+    h1 { font-size: 1.5rem; display: flex; align-items: center; gap: 10px; }
+    .badge { padding: 5px 12px; border-radius: 999px; font-size: 0.82rem; font-weight: 600; }
+    .badge.ok { background: rgba(29,185,84,0.18); color: var(--green); border: 1px solid var(--green); }
+
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 24px; }
+    @media (max-width: 760px) { .grid { grid-template-columns: 1fr; } }
+
+    .card { background: var(--card); border: 1px solid var(--edge); border-radius: 12px; padding: 20px; margin-bottom: 20px; }
+    .card h2 { font-size: 1.05rem; margin-bottom: 14px; color: var(--green); display: flex; justify-content: space-between; align-items: center; }
+
+    .status-row { display: flex; align-items: center; gap: 18px; margin-bottom: 16px; }
+    .vinyl {
+      width: 74px; height: 74px; border-radius: 50%;
+      background: radial-gradient(circle, var(--green) 0 18%, #111 19% 46%, #2b313a 47% 49%, #111 50% 100%);
+      border: 2px solid var(--edge);
+      flex-shrink: 0;
+    }
+    .vinyl.spinning { animation: spin 3s linear infinite; }
+    @keyframes spin { 100% { transform: rotate(360deg); } }
+
+    label { display: block; font-size: 0.84rem; color: var(--muted); margin: 10px 0 4px; }
+    input, select {
+      width: 100%; padding: 9px 12px; border-radius: 8px;
+      border: 1px solid var(--edge); background: #0c0e12; color: var(--text);
+    }
+    .btn-row { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
+    button {
+      cursor: pointer; border: none; border-radius: 8px; padding: 9px 14px;
+      font-weight: 600; font-size: 0.88rem; background: var(--edge); color: var(--text);
+      transition: opacity 0.15s;
+    }
+    button:hover { opacity: 0.88; }
+    button.primary { background: var(--green); color: #08120b; }
+    button.danger { background: var(--danger); color: #fff; }
+
+    table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+    th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--edge); font-size: 0.9rem; }
+    th { color: var(--muted); font-size: 0.8rem; text-transform: uppercase; }
+    code { background: #0c0e12; padding: 3px 6px; border-radius: 5px; color: var(--amber); }
+
+    /* Resultados de busca Spotify */
+    .search-result-item {
+      display: flex; align-items: center; gap: 10px; padding: 8px 10px;
+      cursor: pointer; border-bottom: 1px solid #1a2029; transition: background 0.15s;
+    }
+    .search-result-item:hover { background: #222a36; }
+    .search-thumb { width: 36px; height: 36px; border-radius: 4px; object-fit: cover; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>🎵 Vitrola Jukebox RFID <span style="color:var(--muted);font-size:0.95rem;">Servidor STI (Porta 3003)</span></h1>
+    <span class="badge ok">Spotify 100% Conectado</span>
+  </header>
+
+  <div class="grid">
+    <!-- Prato da Vitrola em tempo real -->
+    <div class="card">
+      <h2>Prato da Vitrola (Tempo Real)</h2>
+      <div class="status-row">
+        <div id="vinylIcon" class="vinyl {% if state.playing %}spinning{% endif %}"></div>
+        <div>
+          <div id="trackTitle" style="font-size:1.15rem;font-weight:700;">{{ state.title }}</div>
+          <div id="trackArtist" style="color:var(--muted);margin-top:2px;">{{ state.artist }}</div>
+          <div style="margin-top:8px;font-size:0.85rem;">
+            Disco no prato: <code id="activeUid">{{ state.active_uid or "NENHUM" }}</code> <span id="unregBadge" style="display:none;background:var(--danger);color:#fff;padding:2px 8px;border-radius:6px;font-size:0.75rem;font-weight:700;">⚠️ DISCO NÃO CADASTRADO</span>
+          </div>
+        </div>
+      </div>
+      <div class="btn-row">
+        <button onclick="controlPlayer('prev')">⏮ Anterior</button>
+        <button class="primary" onclick="controlPlayer('toggle')">⏯ Play / Pause</button>
+        <button onclick="controlPlayer('next')">⏭ Proxima</button>
+        <button class="danger" onclick="simulateRemove()">⏹ Tirar Disco</button>
+      </div>
+
+      <label style="margin-top:14px;">🔊 Aparelho de Saída Spotify:</label>
+      <select id="preferredDevice" onchange="changeDevice(this.value)">
+        <option value="">-- Automático (Primeiro disponível) --</option>
+        {% for d in devices %}
+          <option value="{{ d.id }}" {% if d.id == cfg.preferred_device_id %}selected{% endif %}>
+            {{ d.name }} ({{ d.type }}) {% if d.is_active %}[Ativo]{% endif %}
+          </option>
+        {% endfor %}
+      </select>
+    </div>
+
+    <!-- Cadastro Rápido de Disco -->
+    <div class="card">
+      <h2>Cadastrar / Editar Disco 3D</h2>
+      <label>UID da Tag RFID (Hexadecimal)</label>
+      <input id="discUid" value="{{ state.last_seen_uid }}" placeholder="Ex: 043963AF" />
+
+      <label>🔍 Buscar Música no Spotify (Autocompletar ao digitar)</label>
+      <input id="searchSpotifyInput" placeholder="Ex: Capital Inicial, Henrique e Juliano..." oninput="onSpotifySearch(this.value)" autocomplete="off" />
+      <div id="searchResults" style="display:none;background:#101318;border:1px solid var(--edge);border-radius:8px;max-height:190px;overflow-y:auto;margin-top:4px;"></div>
+
+      <label>Nome do Disco / Álbum</label>
+      <input id="discName" placeholder="Ex: Pink Floyd - The Dark Side of the Moon" />
+
+      <label>Link ou URI do Spotify (Playlist, Álbum ou Faixa)</label>
+      <input id="discUri" placeholder="Cole: https://open.spotify.com/playlist/..." />
+
+      <div class="btn-row">
+        <button class="primary" onclick="saveDisc()">Salvar Disco no Servidor</button>
+        <button type="button" style="background:#2b313a;" onclick="simulatePlace('99887766')">🎲 Simular Tag Virgem</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Catálogo de Discos Cadastrados -->
+  <div class="card">
+    <h2>Catálogo de Discos Cadastrados (discos.json)</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>UID da Tag</th>
+          <th>Nome do Álbum / Disco</th>
+          <th>Link / URI</th>
+          <th>Ações</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for uid, info in discs.items() %}
+        <tr>
+          <td><code>{{ uid }}</code></td>
+          <td><strong>{{ info.name }}</strong></td>
+          <td style="color:var(--muted);font-size:0.82rem;">{{ info.uri }}</td>
+          <td>
+            <button class="primary" onclick="simulatePlace('{{ uid }}')">▶ Testar Giro</button>
+            <button onclick="simulateRemove()">⏹ Tirar</button>
+            <button class="danger" onclick="deleteDisc('{{ uid }}')">Excluir</button>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Músicas em Cache / Baixadas no Servidor -->
+  <div class="card">
+    <h2>
+      <span>💾 Músicas no Cache do Servidor e SD ({{ cached_tracks|length }} faixas disponíveis)</span>
+      <input id="filterCache" placeholder="Filtrar faixas..." oninput="filterCache(this.value)" style="max-width:220px;padding:6px 10px;font-size:0.82rem;" />
+    </h2>
+    <div style="max-height:360px;overflow-y:auto;">
+      <table>
+        <thead>
+          <tr>
+            <th>Faixa / ID Spotify</th>
+            <th>Tamanho</th>
+            <th>Ação Rápida</th>
+          </tr>
+        </thead>
+        <tbody id="cachedTableBody">
+          {% for t in cached_tracks %}
+          <tr class="cached-row">
+            <td>
+              <strong class="cached-title">{{ t.name }}</strong>
+              <div style="font-size:0.75rem;color:var(--muted);"><code>{{ t.track_id }}</code></div>
+            </td>
+            <td style="color:var(--muted);font-size:0.85rem;">{{ t.size_mb }} MB</td>
+            <td>
+              <button class="primary" style="padding:6px 12px;font-size:0.82rem;" onclick="linkTrackToPlate('{{ t.track_id }}', '{{ t.name }}')">📌 Vincular à Tag no Prato</button>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    const API_BASE = window.location.pathname.startsWith('/jukebox') ? '/jukebox' : '';
+    let searchTimeout = null;
+
+    async function changeDevice(deviceId) {
+      await fetch(API_BASE + '/api/web/set_device', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({device_id: deviceId})
+      });
+    }
+
+    async function saveDisc() {
+      const uid = document.getElementById('discUid').value.trim();
+      const name = document.getElementById('discName').value.trim();
+      const uri = document.getElementById('discUri').value.trim();
+      if (!uid || !uri) { alert('Preencha o UID e o link do Spotify!'); return; }
+      const res = await fetch(API_BASE + '/api/web/save_disc', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({uid, name, uri})
+      });
+      if (res.ok) location.reload();
+    }
+
+    async function deleteDisc(uid) {
+      if (!confirm('Deseja excluir este disco?')) return;
+      await fetch(API_BASE + '/api/web/delete_disc', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({uid})
+      });
+      location.reload();
+    }
+
+    async function simulatePlace(uid) {
+      await fetch(API_BASE + '/api/disc/place', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({uid})
+      });
+      refreshStatus();
+    }
+
+    async function simulateRemove() {
+      await fetch(API_BASE + '/api/disc/remove', {method: 'POST'});
+      refreshStatus();
+    }
+
+    async function controlPlayer(action) {
+      await fetch(API_BASE + '/api/player/' + action, {method: 'POST'});
+      refreshStatus();
+    }
+
+    // Busca ao vivo no Spotify
+    function onSpotifySearch(query) {
+      clearTimeout(searchTimeout);
+      const resDiv = document.getElementById('searchResults');
+      if (!query || query.length < 2) {
+        resDiv.style.display = 'none';
+        return;
+      }
+      searchTimeout = setTimeout(async () => {
+        try {
+          const r = await fetch(API_BASE + '/api/spotify/search?q=' + encodeURIComponent(query));
+          const list = await r.json();
+          if (!list || list.length === 0) {
+            resDiv.innerHTML = '<div style="padding:10px;color:var(--muted);font-size:0.85rem;">Nenhum resultado encontrado.</div>';
+            resDiv.style.display = 'block';
+            return;
+          }
+          let html = '';
+          for (const item of list) {
+            html += `
+              <div class="search-result-item" onclick="selectSearchResult('${item.id}', '${item.name.replace(/'/g, "\\'")}', '${item.artist.replace(/'/g, "\\'")}', '${item.uri}')">
+                ${item.cover_url ? `<img src="${item.cover_url}" class="search-thumb" />` : ''}
+                <div>
+                  <div style="font-weight:600;font-size:0.88rem;">${item.name}</div>
+                  <div style="font-size:0.75rem;color:var(--muted);">${item.artist}</div>
+                </div>
+              </div>
+            `;
+          }
+          resDiv.innerHTML = html;
+          resDiv.style.display = 'block';
+        } catch (e) {}
+      }, 350);
+    }
+
+    function selectSearchResult(id, name, artist, uri) {
+      document.getElementById('discName').value = name + ' - ' + artist;
+      document.getElementById('discUri').value = uri;
+      document.getElementById('searchResults').style.display = 'none';
+      document.getElementById('searchSpotifyInput').value = '';
+    }
+
+    // Vincula faixa do cache instantaneamente ao disco no prato
+    function linkTrackToPlate(trackId, trackName) {
+      const lastUid = document.getElementById('discUid').value.trim() || document.getElementById('activeUid').innerText.trim();
+      if (!lastUid || lastUid === 'NENHUM') {
+        alert('Coloque uma tag no prato da vitrola primeiro para capturar seu UID!');
+        return;
+      }
+      document.getElementById('discUid').value = lastUid;
+      document.getElementById('discName').value = trackName.startsWith('Faixa') ? ('Disco ' + lastUid) : trackName;
+      document.getElementById('discUri').value = 'spotify:track:' + trackId;
+      saveDisc();
+    }
+
+    // Filtrar tabela de cache
+    function filterCache(txt) {
+      const filter = txt.toLowerCase();
+      const rows = document.querySelectorAll('.cached-row');
+      rows.forEach(r => {
+        const text = r.innerText.toLowerCase();
+        r.style.display = text.includes(filter) ? '' : 'none';
+      });
+    }
+
+    async function refreshStatus() {
+      try {
+        const res = await fetch(API_BASE + '/api/status');
+        const s = await res.json();
+        document.getElementById('trackTitle').innerText = s.title;
+        document.getElementById('trackArtist').innerText = s.artist;
+        document.getElementById('activeUid').innerText = s.active_uid || 'NENHUM';
+        
+        const badge = document.getElementById('unregBadge');
+        if (s.active_uid && !s.registered) {
+          if (badge) badge.style.display = 'inline';
+          const uidField = document.getElementById('discUid');
+          if (uidField && !uidField.value) uidField.value = s.active_uid;
+        } else {
+          if (badge) badge.style.display = 'none';
+        }
+
+        const vinyl = document.getElementById('vinylIcon');
+        if (s.playing) vinyl.classList.add('spinning');
+        else vinyl.classList.remove('spinning');
+      } catch (e) {}
+    }
+
+    setInterval(refreshStatus, 2000);
+  </script>
+</body>
+</html>

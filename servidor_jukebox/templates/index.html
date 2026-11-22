@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Vitrola Jukebox RFID — Painel Spotify</title>
+  <style>
+    :root {
+      --bg: #0f1216;
+      --card: #181c22;
+      --edge: #28303b;
+      --green: #1db954;
+      --amber: #f5a623;
+      --text: #f3f5f8;
+      --muted: #939eae;
+      --danger: #e5534b;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: system-ui, -apple-system, sans-serif; }
+    body { background: var(--bg); color: var(--text); padding: 24px; max-width: 1000px; margin: 0 auto; }
+    header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; border-bottom: 1px solid var(--edge); padding-bottom: 16px; }
+    h1 { font-size: 1.5rem; display: flex; align-items: center; gap: 10px; }
+    .badge { padding: 5px 12px; border-radius: 999px; font-size: 0.82rem; font-weight: 600; }
+    .badge.ok { background: rgba(29,185,84,0.18); color: var(--green); border: 1px solid var(--green); }
+    .badge.warn { background: rgba(245,166,35,0.18); color: var(--amber); border: 1px solid var(--amber); }
+
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 24px; }
+    @media (max-width: 760px) { .grid { grid-template-columns: 1fr; } }
+
+    .card { background: var(--card); border: 1px solid var(--edge); border-radius: 12px; padding: 20px; }
+    .card h2 { font-size: 1.05rem; margin-bottom: 14px; color: var(--green); }
+
+    .status-row { display: flex; align-items: center; gap: 18px; margin-bottom: 16px; }
+    .vinyl {
+      width: 74px; height: 74px; border-radius: 50%;
+      background: radial-gradient(circle, var(--green) 0 18%, #111 19% 46%, #2b313a 47% 49%, #111 50% 100%);
+      border: 2px solid var(--edge);
+      flex-shrink: 0;
+    }
+    .vinyl.spinning { animation: spin 3s linear infinite; }
+    @keyframes spin { 100% { transform: rotate(360deg); } }
+
+    label { display: block; font-size: 0.84rem; color: var(--muted); margin: 10px 0 4px; }
+    input, select {
+      width: 100%; padding: 9px 12px; border-radius: 8px;
+      border: 1px solid var(--edge); background: #0c0e12; color: var(--text);
+    }
+    .btn-row { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
+    button {
+      cursor: pointer; border: none; border-radius: 8px; padding: 9px 14px;
+      font-weight: 600; font-size: 0.88rem; background: var(--edge); color: var(--text);
+      transition: opacity 0.15s;
+    }
+    button:hover { opacity: 0.88; }
+    button.primary { background: var(--green); color: #08120b; }
+    button.amber { background: var(--amber); color: #1a1102; }
+    button.danger { background: var(--danger); color: #fff; }
+
+    table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+    th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--edge); font-size: 0.9rem; }
+    th { color: var(--muted); font-size: 0.8rem; text-transform: uppercase; }
+    code { background: #0c0e12; padding: 3px 6px; border-radius: 5px; color: var(--amber); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>🎵 Vitrola Jukebox RFID <span style="color:var(--muted);font-size:0.95rem;">ESP32 CYD + Spotify</span></h1>
+    <div style="display:flex;align-items:center;gap:12px;">
+      {% if spotify_connected %}
+        <span class="badge ok">✓ Spotify Conectado</span>
+      {% else %}
+        <span class="badge warn">Modo Simulação</span>
+        <a href="/login" style="text-decoration:none;padding:7px 15px;border-radius:8px;background:#1db954;color:#08120b;font-weight:700;font-size:0.85rem;box-shadow:0 2px 8px rgba(29,185,84,0.3);">🔑 Conectar Spotify (Fazer Login)</a>
+      {% endif %}
+    </div>
+  </header>
+
+  <div class="grid">
+    <!-- Status ao vivo da Vitrola -->
+    <div class="card">
+      <h2>Prato da Vitrola (Tempo Real)</h2>
+      <div class="status-row">
+        <div id="vinylIcon" class="vinyl {% if state.playing %}spinning{% endif %}"></div>
+        <div>
+          <div id="trackTitle" style="font-size:1.15rem;font-weight:700;">{{ state.title }}</div>
+          <div id="trackArtist" style="color:var(--muted);margin-top:2px;">{{ state.artist }}</div>
+          <div style="margin-top:8px;font-size:0.85rem;">
+            Disco no prato: <code id="activeUid">{{ state.active_uid or "NENHUM" }}</code>
+            | Última tag lida: <code id="lastSeenUid">{{ state.last_seen_uid }}</code>
+          </div>
+        </div>
+      </div>
+      <div class="btn-row">
+        <button class="amber" onclick="bindCurrentSpotify()">📌 Gravar Música/Playlist Atual do Spotify no Disco</button>
+        <button onclick="useLastUid()">Usar Última Tag no Formulário</button>
+      </div>
+    </div>
+
+    <!-- Cadastro Rápido de Disco -->
+    <div class="card">
+      <h2>Cadastrar / Editar Disco de Vinil 3D</h2>
+      <label>UID da Tag RFID (4 bytes em Hex)</label>
+      <input id="discUid" value="{{ state.last_seen_uid }}" placeholder="Ex: 1A2B3C4D" />
+
+      <label>Nome do Disco / Álbum</label>
+      <input id="discName" placeholder="Ex: Queen - Greatest Hits" />
+
+      <label>Link ou URI do Spotify (Playlist, Álbum ou Música)</label>
+      <input id="discUri" placeholder="Cole o link: https://open.spotify.com/playlist/..." />
+
+      <div class="btn-row">
+        <button class="primary" onclick="saveDisc()">Salvar Disco</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Lista de Discos Cadastrados -->
+  <div class="card" style="margin-bottom:24px;">
+    <h2>Catálogo de Discos Cadastrados (discos.json)</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>UID da Tag</th>
+          <th>Nome do Disco</th>
+          <th>Spotify URI</th>
+          <th>Ações</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for uid, info in discs.items() %}
+        <tr>
+          <td><code>{{ uid }}</code></td>
+          <td><strong>{{ info.name }}</strong></td>
+          <td style="color:var(--muted);font-size:0.82rem;">{{ info.uri }}</td>
+          <td>
+            <button class="primary" onclick="simulatePlace('{{ uid }}')">▶ Testar no Prato</button>
+            <button onclick="simulateRemove()">⏹ Tirar Disco</button>
+            <button class="danger" onclick="deleteDisc('{{ uid }}')">Excluir</button>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Configuração da Conta Spotify Família -->
+  <div class="card">
+    <h2>Configuração da API do Spotify (Conta Família dedicada)</h2>
+    <p style="color:var(--muted);font-size:0.86rem;margin-bottom:10px;">
+      1. Acesse <strong>developer.spotify.com/dashboard</strong> e crie um App.<br>
+      2. Em <em>Redirect URIs</em>, adicione: <code>http://127.0.0.1:3003/callback</code><br>
+      3. Cole abaixo o <strong>Client ID</strong> e o <strong>Client Secret</strong> e clique em Salvar.
+    </p>
+    <div class="grid" style="margin-bottom:0;">
+      <div>
+        <label>Spotify Client ID</label>
+        <input id="cfgClientId" value="{{ cfg.client_id }}" placeholder="Seu Client ID" />
+        <label>Spotify Client Secret</label>
+        <input id="cfgClientSecret" type="password" value="{{ cfg.client_secret }}" placeholder="Seu Client Secret" />
+      </div>
+      <div>
+        <label>Redirect URI</label>
+        <input id="cfgRedirect" value="{{ cfg.redirect_uri }}" />
+        <label>Caixa de Som / Aparelho Preferido (JBL / PC)</label>
+        <select id="cfgDevice">
+          <option value="">Automático (Aparelho ativo no momento)</option>
+          {% for d in devices %}
+            <option value="{{ d.id }}" {% if cfg.preferred_device_id == d.id %}selected{% endif %}>
+              {{ d.name }} ({{ d.type }})
+            </option>
+          {% endfor %}
+        </select>
+      </div>
+    </div>
+    <div class="btn-row">
+      <button class="primary" onclick="saveSpotifyConfig()">Salvar Credenciais Spotify</button>
+    </div>
+  </div>
+
+  <script>
+    async function saveDisc() {
+      const uid = document.getElementById('discUid').value.trim();
+      const name = document.getElementById('discName').value.trim();
+      const uri = document.getElementById('discUri').value.trim();
+      const res = await fetch('/api/web/save_disc', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({uid, name, uri})
+      });
+      if (res.ok) location.reload();
+      else alert('Preencha o UID e o link do Spotify!');
+    }
+
+    async function deleteDisc(uid) {
+      await fetch('/api/web/delete_disc', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({uid})
+      });
+      location.reload();
+    }
+
+    async function simulatePlace(uid) {
+      await fetch('/api/disc/place', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({uid})
+      });
+      refreshStatus();
+    }
+
+    async function simulateRemove() {
+      await fetch('/api/disc/remove', {method: 'POST'});
+      refreshStatus();
+    }
+
+    async function bindCurrentSpotify() {
+      const uid = document.getElementById('discUid').value.trim();
+      const res = await fetch('/api/disc/bind', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({uid})
+      });
+      const data = await res.json();
+      alert(data.message || 'Operação concluída');
+      if (data.ok) location.reload();
+    }
+
+    function useLastUid() {
+      document.getElementById('discUid').value = document.getElementById('lastSeenUid').innerText.trim();
+    }
+
+    async function saveSpotifyConfig() {
+      const payload = {
+        client_id: document.getElementById('cfgClientId').value.trim(),
+        client_secret: document.getElementById('cfgClientSecret').value.trim(),
+        redirect_uri: document.getElementById('cfgRedirect').value.trim(),
+        preferred_device_id: document.getElementById('cfgDevice').value
+      };
+      await fetch('/api/web/save_config', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload)
+      });
+      location.reload();
+    }
+
+    async function refreshStatus() {
+      try {
+        const res = await fetch('/api/status');
+        const s = await res.json();
+        document.getElementById('trackTitle').innerText = s.title;
+        document.getElementById('trackArtist').innerText = s.artist;
+        document.getElementById('activeUid').innerText = s.active_uid || 'NENHUM';
+        document.getElementById('lastSeenUid').innerText = s.last_seen_uid || '';
+        const vinyl = document.getElementById('vinylIcon');
+        if (s.playing) vinyl.classList.add('spinning');
+        else vinyl.classList.remove('spinning');
+      } catch (e) {}
+    }
+
+    setInterval(refreshStatus, 2000);
+  </script>
+</body>
+</html>

@@ -1,0 +1,30 @@
+# Arduino / ESP32 Build Artifacts
+build/
+*.bin
+*.elf
+*.hex
+*.o
+*.d
+*.map
+*.bak
+*~
+
+# Python cache e ambientes virtuais
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+.env
+
+# Credenciais e Tokens locais (veja spotify_config.example.json)
+spotify_token.json
+servidor_jukebox/spotify_config.json
+
+# Sistema Operacional e IDEs
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.tmp
