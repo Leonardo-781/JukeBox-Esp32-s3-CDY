@@ -108,6 +108,7 @@ void reloadCydWifiMulti();
 String getCydWifiDatabaseJson();
 void fetchCoverFrames();
 String getLocalAudioPath(const String& uid);
+void reloadDiscsCache();
 void startLocalAudio(const String& uid);
 void stopLocalAudio();
 void syncDiscsJsonFromHost();
@@ -188,6 +189,7 @@ void setup() {
                   cardType, sdCardSizeBytes / (1024 * 1024));
     if (!SD.exists("/covers")) SD.mkdir("/covers");
     if (!SD.exists("/audio"))  SD.mkdir("/audio");
+    reloadDiscsCache();
   } else {
     Serial.println("[SD] Nenhum cartao MicroSD detectado ou falha na montagem.");
   }
@@ -785,6 +787,24 @@ void drawFullUI() {
 // ==============================================================================
 // STREAMING DE AUDIO LOCAL DIRETO DO MICROSD PARA O ESP32-S3 VIA UART (1.5 Mbps)
 // ==============================================================================
+static DynamicJsonDocument discsCache(4096);
+static bool discsCacheLoaded = false;
+
+void reloadDiscsCache() {
+  if (!hasSdCard) return;
+  const char* path = SD.exists("/discs.json") ? "/discs.json" : (SD.exists("/discos.json") ? "/discos.json" : nullptr);
+  if (path) {
+    File f = SD.open(path, FILE_READ);
+    if (f) {
+      discsCache.clear();
+      deserializeJson(discsCache, f);
+      f.close();
+      discsCacheLoaded = true;
+      Serial.printf("[SD CACHE] Catalogo de discos carregado na RAM com sucesso (%s)\n", path);
+    }
+  }
+}
+
 String getLocalAudioPath(const String& uid) {
   if (!hasSdCard || uid.length() == 0 || uid == "NENHUM") return "";
 
@@ -794,42 +814,17 @@ String getLocalAudioPath(const String& uid) {
     return directPath;
   }
 
-  // 2. Busca pelo mapeamento no /discs.json (raiz do cartao MicroSD)
-  if (SD.exists("/discs.json")) {
-    File f = SD.open("/discs.json", FILE_READ);
-    if (f) {
-      DynamicJsonDocument doc(4096);
-      DeserializationError err = deserializeJson(doc, f);
-      f.close();
-      if (!err && doc.containsKey(uid)) {
-        String uri = doc[uid]["uri"] | "";
-        if (uri.startsWith("spotify:track:")) {
-          String trackId = uri.substring(14);
-          String trackPath = "/audio/" + trackId + ".s16";
-          if (SD.exists(trackPath)) {
-            return trackPath;
-          }
-        }
-      }
-    }
+  // 2. Busca instantanea pelo catalogo em cache na RAM (0 ms de latencia!)
+  if (!discsCacheLoaded) {
+    reloadDiscsCache();
   }
-
-  // 3. Fallback no /discos.json
-  if (SD.exists("/discos.json")) {
-    File f = SD.open("/discos.json", FILE_READ);
-    if (f) {
-      DynamicJsonDocument doc(4096);
-      DeserializationError err = deserializeJson(doc, f);
-      f.close();
-      if (!err && doc.containsKey(uid)) {
-        String uri = doc[uid]["uri"] | "";
-        if (uri.startsWith("spotify:track:")) {
-          String trackId = uri.substring(14);
-          String trackPath = "/audio/" + trackId + ".s16";
-          if (SD.exists(trackPath)) {
-            return trackPath;
-          }
-        }
+  if (discsCacheLoaded && discsCache.containsKey(uid)) {
+    String uri = discsCache[uid]["uri"] | "";
+    if (uri.startsWith("spotify:track:")) {
+      String trackId = uri.substring(14);
+      String trackPath = "/audio/" + trackId + ".s16";
+      if (SD.exists(trackPath)) {
+        return trackPath;
       }
     }
   }
@@ -902,6 +897,7 @@ void syncDiscsJsonFromHost() {
     if (f) {
       http.writeToStream(&f);
       f.close();
+      reloadDiscsCache();
       Serial.println("[SD SYNC] /discs.json atualizado do servidor com sucesso!");
     }
   }

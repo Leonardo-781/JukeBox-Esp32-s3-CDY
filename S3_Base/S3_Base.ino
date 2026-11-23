@@ -58,14 +58,15 @@
 #define MOTOR_DEFAULT_SPEED   65
 #define MOTOR_KICK_POWER      115
 #define MOTOR_KICK_TIME_MS    80
-#define RFID_CHECK_INTERVAL   350
-#define MAX_DISC_MISSES       4
+#define RFID_CHECK_INTERVAL   120      // 120 ms para leitura agil e continua
+#define MAX_DISC_MISSES       12       // 12 leituras de tolerancia (~1.4s) para tags em movimento no prato
 
 // Parametros de Audio Hi-Fi com Buffer Gigante de 1 MB
 #define SAMPLE_RATE           44100
 #define RING_SIZE_PSRAM       1048576  // 1 MB em PSRAM (~12 segundos de som ininterrupto!)
 #define RING_SIZE_SRAM        65536    // 64 KB fallback
-#define PREFILL_BYTES         65536    // 64 KB pre-buffer (~740 ms)
+#define PREFILL_BYTES_NET     65536    // 64 KB pre-buffer para streaming Wi-Fi/Nuvem (~740 ms)
+#define PREFILL_BYTES_SD      4096     // 4 KB pre-buffer para reproducao do Cartao SD (<30 ms de latencia!)
 #define PLAY_CHUNK            1024
 
 #define AP_TIMEOUT_MS         300000   // 5 minutos de timeout no AP antes de voltar a tentar STA
@@ -119,6 +120,11 @@ int missingChecks        = 0;
 unsigned long lastRfidCheckTime = 0;
 unsigned long lastAudioRec      = 0;
 unsigned long lastSyncTime      = 0;
+
+// Notificacoes assincronas de disco (evita bloqueio HTTP no milissegundo de play)
+static bool pendingDiscPlace    = false;
+static bool pendingDiscRemove   = false;
+static char pendingDiscUid[32]  = {0};
 
 // Prototipos
 void setupHardware();
@@ -718,8 +724,9 @@ void loop() {
 
   // 2. Playback I2S continuo com o Buffer Gigante
   uint32_t used = audioRingUsed();
+  uint32_t targetPrefill = isLocalAudioMode ? PREFILL_BYTES_SD : PREFILL_BYTES_NET;
   if (audioBuffering) {
-    if (used >= PREFILL_BYTES) audioBuffering = false;
+    if (used >= targetPrefill) audioBuffering = false;
   } else if (used < 2) {
     audioBuffering = true;
   }
@@ -751,6 +758,14 @@ void loop() {
         missingChecks = 0;
       } else {
         missingChecks++;
+        if (missingChecks >= 3) {
+          // Watchdog RC522: se o barramento SPI travar por interferencia do motor, recupera limpo
+          byte v = rfid.PCD_ReadRegister(MFRC522::VersionReg);
+          if (v == 0x00 || v == 0xFF) {
+            rfid.PCD_Init();
+            reinitRfidRegisters(MFRC522::RxGain_max);
+          }
+        }
         if (missingChecks >= MAX_DISC_MISSES) {
           Serial.println("[RFID] Disco retirado da vitrola!");
           handleDiscRemoved();
@@ -760,15 +775,19 @@ void loop() {
       byte bufferATQA[2];
       byte bufferSize = sizeof(bufferATQA);
 
-      reinitRfidRegisters(MFRC522::RxGain_max);
-      if (rfid.PICC_WakeupA(bufferATQA, &bufferSize) == MFRC522::STATUS_OK ||
-          rfid.PICC_RequestA(bufferATQA, &bufferSize) == MFRC522::STATUS_OK) {
+      // Leitura de novo disco: aceita STATUS_OK e STATUS_COLLISION (normal em tags em movimento)
+      byte st = rfid.PICC_WakeupA(bufferATQA, &bufferSize);
+      if (st != MFRC522::STATUS_OK && st != MFRC522::STATUS_COLLISION) {
+        bufferSize = sizeof(bufferATQA);
+        st = rfid.PICC_RequestA(bufferATQA, &bufferSize);
+      }
+
+      if (st == MFRC522::STATUS_OK || st == MFRC522::STATUS_COLLISION) {
         if (rfid.PICC_ReadCardSerial()) {
           char uidHex[32] = {0};
           for (byte i = 0; i < rfid.uid.size; i++) {
             snprintf(uidHex + strlen(uidHex), sizeof(uidHex) - strlen(uidHex), "%02X", rfid.uid.uidByte[i]);
           }
-          rfid.PICC_HaltA();
           rfid.PCD_StopCrypto1();
 
           Serial.printf("[RFID] >>> DISCO DETECTADO! UID: %s <<<\n", uidHex);
@@ -778,7 +797,16 @@ void loop() {
     }
   }
 
-  // 4. Sincronizacao de Estado com o Servidor (a cada 3s)
+  // 4. Envio de eventos pendentes de disco em segundo plano (evita congelar CPU no inicio do play)
+  if (pendingDiscPlace) {
+    pendingDiscPlace = false;
+    sendDiscEvent("/api/disc/place", pendingDiscUid);
+  } else if (pendingDiscRemove) {
+    pendingDiscRemove = false;
+    sendDiscEvent("/api/disc/remove", "");
+  }
+
+  // 5. Sincronizacao de Estado com o Servidor (a cada 3s)
   if (now - lastSyncTime >= 3000) {
     lastSyncTime = now;
     syncServerState();
@@ -937,16 +965,13 @@ bool checkCardPresent(const char* targetUid) {
   byte bufferATQA[2];
   byte bufferSize = sizeof(bufferATQA);
 
-  reinitRfidRegisters(MFRC522::RxGain_max);
-  if (rfid.PICC_WakeupA(bufferATQA, &bufferSize) != MFRC522::STATUS_OK) {
-    reinitRfidRegisters(MFRC522::RxGain_43dB);
+  // Testa deteccao da tag no campo RF: aceita STATUS_OK e STATUS_COLLISION
+  byte st = rfid.PICC_WakeupA(bufferATQA, &bufferSize);
+  if (st != MFRC522::STATUS_OK && st != MFRC522::STATUS_COLLISION) {
     bufferSize = sizeof(bufferATQA);
-    if (rfid.PICC_RequestA(bufferATQA, &bufferSize) != MFRC522::STATUS_OK) {
-      reinitRfidRegisters(MFRC522::RxGain_33dB);
-      bufferSize = sizeof(bufferATQA);
-      if (rfid.PICC_WakeupA(bufferATQA, &bufferSize) != MFRC522::STATUS_OK) {
-        return false;
-      }
+    st = rfid.PICC_RequestA(bufferATQA, &bufferSize);
+    if (st != MFRC522::STATUS_OK && st != MFRC522::STATUS_COLLISION) {
+      return false;
     }
   }
 
@@ -956,7 +981,8 @@ bool checkCardPresent(const char* targetUid) {
   for (byte i = 0; i < rfid.uid.size; i++) {
     snprintf(uid + strlen(uid), sizeof(uid) - strlen(uid), "%02X", rfid.uid.uidByte[i]);
   }
-  rfid.PICC_HaltA();
+
+  // NAO adormecemos a tag com PICC_HaltA() para manter a comunicacao estavel durante a rotacao
   rfid.PCD_StopCrypto1();
 
   return (strcasecmp(uid, targetUid) == 0);
@@ -1004,10 +1030,19 @@ void handleDiscPlaced(const char* uidHex) {
   isLocalAudioMode = false;
   missingChecks = 0;
 
-  playNeedleDropEffect();
-  startMotorWithKick(currentMotorSpeed > 0 ? currentMotorSpeed : MOTOR_DEFAULT_SPEED);
-  sendDiscEvent("/api/disc/place", uidHex);
+  // 1. NOTIFICACAO INSTANTANEA AO CYD (0 ms! Dispara busca e streaming local no SD imediatamente)
   sendCydTelemetry();
+
+  // 2. Aciona o motor com impulso de partida (Kickstart)
+  startMotorWithKick(currentMotorSpeed > 0 ? currentMotorSpeed : MOTOR_DEFAULT_SPEED);
+
+  // 3. Efeito vintage de agulha no sulco
+  playNeedleDropEffect();
+
+  // 4. Agenda envio HTTP para o servidor sem congelar o inicio da musica
+  strncpy(pendingDiscUid, uidHex, sizeof(pendingDiscUid) - 1);
+  pendingDiscPlace = true;
+  pendingDiscRemove = false;
 }
 
 void handleDiscRemoved() {
@@ -1016,10 +1051,16 @@ void handleDiscRemoved() {
   isLocalAudioMode = false;
   strncpy(activeUidHex, "NENHUM", sizeof(activeUidHex) - 1);
 
+  // 1. Notifica o CYD imediatamente para cessar o streaming local
+  sendCydTelemetry();
+
+  // 2. Efeito sonoro de parada e desligamento do motor
   playVinylStopEffect();
   stopMotor();
-  sendDiscEvent("/api/disc/remove", "");
-  sendCydTelemetry();
+
+  // 3. Agenda envio de remocao ao servidor
+  pendingDiscRemove = true;
+  pendingDiscPlace = false;
 }
 
 // Envia evento para a API (com suporte hibrido LAN vs Nuvem)
