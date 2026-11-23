@@ -9,6 +9,7 @@
 #include <Preferences.h>
 #include <TFT_eSPI.h>
 #include <ArduinoJson.h>
+#include "track_catalog.h"
 
 // ==============================================================================
 // REDE WI-FI E SERVIDOR SPOTIFY
@@ -101,7 +102,7 @@ void drawHeader();
 void drawVinylVisualizer(uint8_t step);
 void drawTrackInfo();
 void drawProgressBar();
-void drawApSetupScreen(const String& apSsid, const String& apIp);
+void drawApSetupScreen(const String& apSsid, const String& apIp, const String& currentUid = "");
 void processSerialCommand(const String& line);
 void pollServerStatus();
 void reloadCydWifiMulti();
@@ -246,12 +247,6 @@ void loop() {
     }
   }
 
-  // Se a tela estiver mostrando o aviso de Modo Setup AP, nao renderiza player
-  if (isApScreen) {
-    delay(20);
-    return;
-  }
-
   // 2. Leitura do Touchscreen Resistivo XPT2046
   uint16_t tx = 0, ty = 0;
   static unsigned long lastTouchTime = 0;
@@ -259,6 +254,12 @@ void loop() {
     if (now - lastTouchTime > 400) {
       lastTouchTime = now;
       Serial.printf("[CYD TOUCH] Toque em X:%d, Y:%d\n", tx, ty);
+
+      // Se estiver no Modo AP, toque em qualquer ponto da tela sai do AP
+      if (isApScreen) {
+        Serial.println("{\"cmd\":\"AP_EXIT\"}");
+        return;
+      }
 
       // Toque no disco de vinil (Play/Pause)
       if (tx < 115 && ty > 35 && ty < 180) {
@@ -272,24 +273,24 @@ void loop() {
       else if (tx > 260 && ty >= 110 && ty < 210) {
         Serial.println("{\"cmd\":\"PLAYER_PREV\"}");
       }
+      // Toque no rodape ou status -> Solicita abrir Modo Setup / AP
+      else if (ty > 210) {
+        Serial.println("{\"cmd\":\"AP_REQUEST\"}");
+      }
     }
   }
 
-  // 3. Mantem Wi-Fi e Sincronizacao Sem Fio
-  if (WiFi.status() == WL_CONNECTED) {
-    if (now - lastWifiPoll >= 1200) {
-      lastWifiPoll = now;
-      pollServerStatus();
-    }
-    if (now - lastDiscsSync >= 45000) {
+  // Se a tela estiver mostrando o aviso de Modo Setup AP, nao renderiza player normal
+  if (isApScreen) {
+    delay(20);
+    return;
+  }
+
+  // 3. Mantem Wi-Fi apenas se conectado (sem travar CPU quando offline)
+  if (WiFi.status() == WL_CONNECTED && !isLocalAudioStreaming) {
+    if (now - lastDiscsSync >= 60000) {
       lastDiscsSync = now;
       syncDiscsJsonFromHost();
-    }
-  } else {
-    static unsigned long lastCydReconnect = 0;
-    if (now - lastCydReconnect >= 4000) {
-      lastCydReconnect = now;
-      if (cydWifiMulti) cydWifiMulti->run();
     }
   }
 
@@ -525,12 +526,103 @@ void processSerialCommand(const String& line) {
         if (cmd == "WIFI_AP_MODE") {
           bool active = doc["active"] | false;
           if (active) {
-            String ssid = doc["ssid"] | "Vitrola-Jukebox-Setup";
+            String ssid = doc["ssid"] | "Jukebox-Setup";
             String ip   = doc["ip"]   | "192.168.4.1";
-            drawApSetupScreen(ssid, ip);
+            String uid  = doc["uid"]  | activeUidHex;
+            drawApSetupScreen(ssid, ip, uid);
           } else {
             isApScreen = false;
             drawFullUI();
+          }
+          return;
+        }
+
+        if (cmd == "AP_TAG_UPDATE") {
+          if (isApScreen) {
+            String uid = doc["uid"] | "";
+            activeUidHex = uid;
+            drawApSetupScreen("Jukebox-Setup", "192.168.4.1", uid);
+          }
+          return;
+        }
+
+        if (cmd == "GET_SD_CATALOG") {
+          if (SD.exists("/discs.json")) {
+            File f = SD.open("/discs.json", FILE_READ);
+            if (f) {
+              String s = f.readString();
+              f.close();
+              Serial.printf("{\"cmd\":\"SD_DISCS\",\"data\":%s}\n", s.c_str());
+            } else {
+              Serial.println("{\"cmd\":\"SD_DISCS\",\"data\":{}}");
+            }
+          } else {
+            Serial.println("{\"cmd\":\"SD_DISCS\",\"data\":{}}");
+          }
+          return;
+        }
+
+        if (cmd == "SAVE_DISC") {
+          String uid    = doc["uid"] | "";
+          String name   = doc["name"] | "";
+          String artist = doc["artist"] | "";
+          String track  = doc["track"] | "";
+          if (uid.length() > 0 && hasSdCard) {
+            DynamicJsonDocument discsDoc(8192);
+            if (SD.exists("/discs.json")) {
+              File fIn = SD.open("/discs.json", FILE_READ);
+              if (fIn) { deserializeJson(discsDoc, fIn); fIn.close(); }
+            }
+            JsonObject obj = discsDoc.createNestedObject(uid);
+            obj["name"]   = name;
+            obj["artist"] = artist;
+            obj["track"]  = track;
+            obj["uri"]    = "spotify:track:" + track;
+
+            File fOut = SD.open("/discs.json", FILE_WRITE);
+            if (fOut) {
+              serializeJson(discsDoc, fOut);
+              fOut.close();
+              reloadDiscsCache();
+              Serial.printf("{\"cmd\":\"SAVE_DISC_OK\",\"uid\":\"%s\"}\n", uid.c_str());
+            }
+          }
+          return;
+        }
+
+        if (cmd == "DELETE_DISC") {
+          String uid = doc["uid"] | "";
+          if (uid.length() > 0 && hasSdCard && SD.exists("/discs.json")) {
+            DynamicJsonDocument discsDoc(8192);
+            File fIn = SD.open("/discs.json", FILE_READ);
+            if (fIn) { deserializeJson(discsDoc, fIn); fIn.close(); }
+            discsDoc.remove(uid);
+            File fOut = SD.open("/discs.json", FILE_WRITE);
+            if (fOut) {
+              serializeJson(discsDoc, fOut);
+              fOut.close();
+              reloadDiscsCache();
+              Serial.printf("{\"cmd\":\"DELETE_DISC_OK\",\"uid\":\"%s\"}\n", uid.c_str());
+            }
+          }
+          return;
+        }
+
+        if (cmd == "PLAY_PREVIEW") {
+          String track = doc["track"] | "";
+          if (track.length() > 0 && hasSdCard) {
+            String path = "/audio/" + track + ".s16";
+            if (SD.exists(path)) {
+              if (localAudioFile) localAudioFile.close();
+              localAudioFile = SD.open(path, FILE_READ);
+              if (localAudioFile && localAudioFile.available() > 0) {
+                isLocalAudioStreaming = true;
+                currentStreamingUid = "PREVIEW";
+                Serial.println("{\"cmd\":\"LOCAL_AUDIO_START\"}");
+                Serial.flush();
+                lastAudioPacketUs = micros();
+              }
+            }
           }
           return;
         }
@@ -609,54 +701,68 @@ void processSerialCommand(const String& line) {
 // ==============================================================================
 // DESENHO DOS COMPONENTES VISUAIS
 // ==============================================================================
-void drawApSetupScreen(const String& apSsid, const String& apIp) {
+void drawApSetupScreen(const String& apSsid, const String& apIp, const String& currentUid) {
   isApScreen = true;
   tft.fillScreen(COL_BG);
 
   // Topo Verde Spotify
-  tft.fillRect(0, 0, 320, 34, COL_SPOTIFY);
-  tft.setCursor(30, 8);
+  tft.fillRect(0, 0, 320, 32, COL_SPOTIFY);
+  tft.setCursor(20, 7);
   tft.setTextColor(COL_BG, COL_SPOTIFY);
   tft.setTextSize(2);
-  tft.print("CONFIGURAR WI-FI");
+  tft.print("MODO CADASTRO & AP");
 
   // Moldura Central
-  tft.drawRoundRect(10, 44, 300, 160, 8, COL_AMBER);
+  tft.drawRoundRect(8, 38, 304, 168, 6, COL_AMBER);
 
-  tft.setCursor(20, 56);
-  tft.setTextColor(COL_WHITE, COL_BG);
+  tft.setCursor(18, 48);
+  tft.setTextColor(COL_MUTED, COL_BG);
   tft.setTextSize(1);
-  tft.print("1. Conecte seu celular no Wi-Fi:");
+  tft.print("1. Conecte no Wi-Fi:");
 
-  tft.setCursor(30, 74);
+  tft.setCursor(26, 62);
   tft.setTextColor(COL_AMBER, COL_BG);
   tft.setTextSize(2);
   tft.print(apSsid);
 
-  tft.setCursor(20, 106);
-  tft.setTextColor(COL_WHITE, COL_BG);
+  tft.setCursor(18, 92);
+  tft.setTextColor(COL_MUTED, COL_BG);
   tft.setTextSize(1);
-  tft.print("2. Abra no navegador do celular:");
+  tft.print("2. Abra no celular ou notebook:");
 
-  tft.setCursor(30, 124);
+  tft.setCursor(26, 106);
   tft.setTextColor(COL_SPOTIFY, COL_BG);
   tft.setTextSize(2);
   tft.printf("http://%s", apIp.c_str());
 
-  tft.setCursor(20, 156);
+  // Status da Tag no Prato em tempo real
+  tft.setCursor(18, 138);
   tft.setTextColor(COL_MUTED, COL_BG);
   tft.setTextSize(1);
-  tft.print("3. Escolha a nova rede e digite a senha.");
+  tft.print("3. Tag no Prato (Tempo Real):");
 
-  tft.setCursor(20, 178);
+  tft.setCursor(26, 154);
+  if (currentUid.length() > 0 && currentUid != "NENHUM") {
+    tft.setTextColor(COL_SPOTIFY, COL_BG);
+    tft.setTextSize(2);
+    tft.printf("[ %s ]", currentUid.c_str());
+  } else {
+    tft.setTextColor(COL_MUTED, COL_BG);
+    tft.setTextSize(1);
+    tft.print("(Aproxime uma tag do prato...)");
+  }
+
+  tft.setCursor(18, 182);
   tft.setTextColor(COL_WHITE, COL_BG);
-  tft.print("-> A vitrola conectara automaticamente!");
+  tft.setTextSize(1);
+  tft.print("-> Cadastre ou edite musicas pelo celular!");
 
-  // Rodape
-  tft.drawFastHLine(0, 215, 320, COL_EDGE);
-  tft.setCursor(15, 224);
+  // Rodape com instrucao de saida
+  tft.drawFastHLine(0, 214, 320, COL_EDGE);
+  tft.setCursor(15, 222);
   tft.setTextColor(COL_MUTED, COL_BG);
-  tft.print("Aguardando configuracao pelo celular...");
+  tft.setTextSize(1);
+  tft.print("[ Toque na tela para sair do Modo Setup ]");
 }
 
 void drawHeader() {
@@ -787,7 +893,7 @@ void drawFullUI() {
 // ==============================================================================
 // STREAMING DE AUDIO LOCAL DIRETO DO MICROSD PARA O ESP32-S3 VIA UART (1.5 Mbps)
 // ==============================================================================
-static DynamicJsonDocument discsCache(4096);
+static DynamicJsonDocument discsCache(8192);
 static bool discsCacheLoaded = false;
 
 void reloadDiscsCache() {
@@ -801,6 +907,29 @@ void reloadDiscsCache() {
       f.close();
       discsCacheLoaded = true;
       Serial.printf("[SD CACHE] Catalogo de discos carregado na RAM com sucesso (%s)\n", path);
+    }
+  } else {
+    // Cria arquivo inicial /discs.json com as tags conhecidas
+    discsCache.clear();
+    JsonObject d1 = discsCache.createNestedObject("043963AF");
+    d1["name"] = "STORM II"; d1["track"] = "0FZd4laxB12sUTKSUUGwWq"; d1["uri"] = "spotify:track:0FZd4laxB12sUTKSUUGwWq";
+    JsonObject d2 = discsCache.createNestedObject("041E21AF");
+    d2["name"] = "Rock Classics"; d2["track"] = "37i9dQZF1DWXRqgorJj26U"; d2["uri"] = "spotify:playlist:37i9dQZF1DWXRqgorJj26U";
+    JsonObject d3 = discsCache.createNestedObject("043963AF8B2681");
+    d3["name"] = "Quase Algo"; d3["track"] = "3Me7nZwb283YVVxTT4eJLe"; d3["uri"] = "spotify:track:3Me7nZwb283YVVxTT4eJLe";
+    JsonObject d4 = discsCache.createNestedObject("042F15AF8B2681");
+    d4["name"] = "Pós"; d4["track"] = "1uDn0nbzeGPVw97jp7SvzR"; d4["uri"] = "spotify:track:1uDn0nbzeGPVw97jp7SvzR";
+    JsonObject d5 = discsCache.createNestedObject("041D43AF8B2681");
+    d5["name"] = "A Sua Maneira"; d5["track"] = "21S2akASCzAq2ZJCMK0l2A"; d5["uri"] = "spotify:track:21S2akASCzAq2ZJCMK0l2A";
+    JsonObject d6 = discsCache.createNestedObject("04FE48AF8B2681");
+    d6["name"] = "Satisfaction"; d6["track"] = "0Iwyzp7GppQxv0Eu6wRkUo"; d6["uri"] = "spotify:track:0Iwyzp7GppQxv0Eu6wRkUo";
+
+    File f = SD.open("/discs.json", FILE_WRITE);
+    if (f) {
+      serializeJson(discsCache, f);
+      f.close();
+      discsCacheLoaded = true;
+      Serial.println("[SD CACHE] /discs.json padrao criado no MicroSD com sucesso!");
     }
   }
 }
@@ -837,17 +966,95 @@ void startLocalAudio(const String& uid) {
 
   String path = getLocalAudioPath(uid);
   if (path.length() == 0) {
-    // Faixa nao encontrada no MicroSD: S3 usara streaming via Wi-Fi automaticamente
+    // Disco nao cadastrado no MicroSD!
+    currentTrackTitle = "Disco Nao Cadastrado";
+    currentArtist     = "Segure Knob 3s p/ Cadastrar";
+    currentDiscName   = "Tag: " + uid;
+    hasCoverFrames    = false;
+    drawTrackInfo();
+    drawFullUI();
+    Serial.printf("[SD AUDIO] Tag %s nao cadastrada em /discs.json\n", uid.c_str());
     return;
   }
+
+  // Identifica a faixa, artista e título localmente
+  String trackId = "";
+  if (discsCacheLoaded && discsCache.containsKey(uid)) {
+    String n = discsCache[uid]["name"] | "";
+    String a = discsCache[uid]["artist"] | "";
+    String t = discsCache[uid]["track"] | "";
+    if (t.length() == 0) {
+      String u = discsCache[uid]["uri"] | "";
+      int idx = u.lastIndexOf(':');
+      t = (idx >= 0) ? u.substring(idx + 1) : u;
+    }
+    trackId = t;
+
+    if (n.length() > 0) {
+      currentTrackTitle = n;
+      currentArtist     = (a.length() > 0) ? a : "Cartao SD";
+    } else {
+      String full = findTrackNameById(trackId.c_str());
+      int sep = full.indexOf(" - ");
+      if (sep > 0) {
+        currentTrackTitle = full.substring(0, sep);
+        currentArtist     = full.substring(sep + 3);
+      } else {
+        currentTrackTitle = full;
+        currentArtist     = "Cartao SD";
+      }
+    }
+  } else {
+    int idxSlash = path.lastIndexOf('/');
+    int idxDot   = path.lastIndexOf('.');
+    trackId = path.substring(idxSlash + 1, idxDot);
+    String full = findTrackNameById(trackId.c_str());
+    int sep = full.indexOf(" - ");
+    if (sep > 0) {
+      currentTrackTitle = full.substring(0, sep);
+      currentArtist     = full.substring(sep + 3);
+    } else {
+      currentTrackTitle = full;
+      currentArtist     = "Cartao SD";
+    }
+  }
+  currentDiscName = currentTrackTitle;
+
+  // Busca capa offline no SD
+  String coverPath = "/covers/" + trackId + ".bin";
+  if (!SD.exists(coverPath)) coverPath = "/covers/" + uid + ".bin";
+  if (SD.exists(coverPath)) {
+    File cf = SD.open(coverPath, FILE_READ);
+    if (cf) {
+      size_t r = cf.read((uint8_t*)coverFrames, sizeof(coverFrames));
+      cf.close();
+      if (r == sizeof(coverFrames)) {
+        hasCoverFrames = true;
+        lastLoadedCoverTrack = currentTrackTitle;
+      }
+    }
+  } else {
+    hasCoverFrames = false;
+  }
+
+  drawTrackInfo();
+  drawFullUI();
 
   if (localAudioFile) localAudioFile.close();
   localAudioFile = SD.open(path, FILE_READ);
   if (localAudioFile && localAudioFile.available() > 0) {
     isLocalAudioStreaming = true;
     currentStreamingUid = uid;
-    Serial.println("{\"cmd\":\"LOCAL_AUDIO_START\"}");
+
+    StaticJsonDocument<256> startDoc;
+    startDoc["cmd"]    = "LOCAL_AUDIO_START";
+    startDoc["title"]  = currentTrackTitle;
+    startDoc["artist"] = currentArtist;
+    String startLine;
+    serializeJson(startDoc, startLine);
+    Serial.println(startLine);
     Serial.flush();
+
     lastAudioPacketUs = micros();
     Serial.printf("[SD AUDIO] >> INICIANDO STREAM LOCAL: %s (%u bytes) <<\n", path.c_str(), localAudioFile.size());
 

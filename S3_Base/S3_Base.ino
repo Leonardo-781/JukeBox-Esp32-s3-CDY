@@ -10,6 +10,8 @@
 #include <MFRC522.h>
 #include <ArduinoJson.h>
 #include <ESP_I2S.h>
+#include "track_catalog.h"
+#include "ap_portal.h"
 
 // ==============================================================================
 // 1. PINAGEM OFICIAL - ESP32-S3 N16R8 (BASE DA VITROLA JUKEBOX)
@@ -84,6 +86,7 @@ HardwareSerial SerialCYD(1);
 Preferences prefs;
 WebServer apServer(80);
 DNSServer dnsServer;
+DynamicJsonDocument sdDiscsDoc(8192);
 
 // Buffer circular dinamico em PSRAM
 static uint8_t* audioRing = nullptr;
@@ -158,6 +161,13 @@ void handleSave();
 void handleDelete();
 void handleExit();
 void handleRedirect();
+void handleApiStatus();
+void handleApiTracks();
+void handleApiDiscs();
+void handleApiSaveDisc();
+void handleApiDeleteDisc();
+void handleApiTestPlay();
+void handleApiSaveWifi();
 
 // Gerenciamento de RingBuffer
 static inline uint32_t audioRingUsed() {
@@ -327,158 +337,164 @@ void handleRedirect() {
 }
 
 void handleExit() {
-  String resp = "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><style>body{background:#121212;color:#fff;font-family:sans-serif;text-align:center;padding:40px;line-height:1.6;}</style></head><body>";
-  resp += "<h2>Modo Setup Encerrado!</h2><p>A Vitrola voltara a tentar conectar nas redes cadastradas.</p></body></html>";
-  apServer.send(200, "text/html", resp);
-  delay(800);
+  apServer.send(200, "text/plain", "OK");
+  delay(200);
   stopApMode();
 }
 
-void handleDelete() {
-  String ssid = apServer.arg("ssid");
-  if (ssid.length() > 0) {
-    deleteWifiFromDatabase(ssid);
-  }
-  apServer.sendHeader("Location", "/");
-  apServer.send(302, "text/plain", "");
+void handleApiStatus() {
+  StaticJsonDocument<256> doc;
+  doc["uid"]            = activeUidHex;
+  doc["is_present"]     = isDiscPresent;
+  doc["is_playing"]     = isPlaying;
+  doc["wifi_connected"] = (WiFi.status() == WL_CONNECTED);
+  doc["wifi_ssid"]      = (WiFi.status() == WL_CONNECTED) ? WiFi.SSID() : "";
+  doc["wifi_ip"]        = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : "";
+
+  String out;
+  serializeJson(doc, out);
+  apServer.send(200, "application/json", out);
 }
 
-void handleSave() {
-  String ssid = apServer.arg("ssid");
-  if (ssid == "__custom__") {
-    ssid = apServer.arg("custom_ssid");
+void handleApiTracks() {
+  String json = "[";
+  for (size_t i = 0; i < TRACK_CATALOG_COUNT; i++) {
+    if (i > 0) json += ",";
+    json += "{\"id\":\"";
+    json += TRACK_CATALOG[i].id;
+    json += "\",\"n\":\"";
+    String name = TRACK_CATALOG[i].name;
+    name.replace("\"", "\\\"");
+    json += name;
+    json += "\"}";
   }
-  ssid.trim();
-  String pass = apServer.arg("pass");
-  pass.trim();
+  json += "]";
+  apServer.send(200, "application/json", json);
+}
 
-  if (ssid.length() == 0) {
-    apServer.send(400, "text/html", "<h3>Nome de rede invalido! <a href='/'>Voltar</a></h3>");
+void handleApiDiscs() {
+  String out;
+  serializeJson(sdDiscsDoc, out);
+  if (out.length() == 0 || out == "null") out = "{}";
+  apServer.send(200, "application/json", out);
+}
+
+void handleApiSaveDisc() {
+  String uid    = apServer.arg("uid");
+  String name   = apServer.arg("name");
+  String artist = apServer.arg("artist");
+  String track  = apServer.arg("track");
+
+  if (uid.length() == 0 || track.length() == 0) {
+    apServer.send(400, "application/json", "{\"ok\":false,\"err\":\"invalid_args\"}");
     return;
   }
 
-  addWifiToDatabase(ssid, pass);
+  // Notifica o CYD para salvar no Cartao MicroSD
+  StaticJsonDocument<512> doc;
+  doc["cmd"]    = "SAVE_DISC";
+  doc["uid"]    = uid;
+  doc["name"]   = name;
+  doc["artist"] = artist;
+  doc["track"]  = track;
+  String line;
+  serializeJson(doc, line);
+  SerialCYD.println(line);
 
-  String resp = "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><style>body{background:#121212;color:#fff;font-family:sans-serif;text-align:center;padding:30px;line-height:1.6;}</style></head><body>";
-  resp += "<h2 style='color:#1DB954;'>✓ Rede Salva com Sucesso!</h2>";
-  resp += "<p>A rede <b>" + ssid + "</b> foi gravada no banco permanente da Vitrola.</p>";
-  resp += "<p>A vitrola esta se conectando agora... Ja pode fechar esta janela.</p>";
-  resp += "</body></html>";
-  apServer.send(200, "text/html", resp);
+  // Atualiza cache em RAM do S3
+  JsonObject obj = sdDiscsDoc.createNestedObject(uid);
+  obj["name"]   = name;
+  obj["artist"] = artist;
+  obj["track"]  = track;
+  obj["uri"]    = "spotify:track:" + track;
 
-  delay(1200);
-  stopApMode();
+  // Som de confirmacao de disco gravado
+  playTone(880.0f, 80, 0.20f);
+  delay(90);
+  playTone(1320.0f, 140, 0.20f);
+
+  apServer.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleApiDeleteDisc() {
+  String uid = apServer.arg("uid");
+  if (uid.length() > 0) {
+    StaticJsonDocument<256> doc;
+    doc["cmd"] = "DELETE_DISC";
+    doc["uid"] = uid;
+    String line;
+    serializeJson(doc, line);
+    SerialCYD.println(line);
+
+    sdDiscsDoc.remove(uid);
+    playTone(440.0f, 100, 0.15f);
+  }
+  apServer.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleApiTestPlay() {
+  String track = apServer.arg("track");
+  if (track.length() > 0) {
+    StaticJsonDocument<256> doc;
+    doc["cmd"]   = "PLAY_PREVIEW";
+    doc["track"] = track;
+    String line;
+    serializeJson(doc, line);
+    SerialCYD.println(line);
+  }
+  apServer.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleApiSaveWifi() {
+  String ssid = apServer.arg("ssid");
+  String pass = apServer.arg("pass");
+  ssid.trim();
+  pass.trim();
+  if (ssid.length() > 0) {
+    addWifiToDatabase(ssid, pass);
+    reloadWifiMulti();
+    sendWifiSyncToCyd();
+  }
+  apServer.send(200, "application/json", "{\"ok\":true}");
 }
 
 void handleRoot() {
-  int n = WiFi.scanNetworks();
-
-  String dbJson = getWifiDatabaseJson();
-  StaticJsonDocument<2048> doc;
-  deserializeJson(doc, dbJson);
-  JsonArray arr = doc.as<JsonArray>();
-
-  String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
-  html += "<title>Vitrola Jukebox - Wi-Fi Manager</title>";
-  html += "<style>";
-  html += "body{background:#121212;color:#eee;font-family:-apple-system,BlinkMacSystemFont,Roboto,sans-serif;margin:0;padding:16px;}";
-  html += ".card{background:#1e1e1e;border-radius:12px;padding:20px;margin-bottom:16px;box-shadow:0 4px 12px rgba(0,0,0,0.4);}";
-  html += "h1{color:#1DB954;font-size:22px;margin:0 0 8px 0;display:flex;align-items:center;gap:8px;}";
-  html += "h2{font-size:16px;color:#fff;margin:0 0 12px 0;border-bottom:1px solid #333;padding-bottom:6px;}";
-  html += ".db-item{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid #282828;}";
-  html += ".db-item:last-child{border-bottom:none;}";
-  html += ".del-btn{background:#e74c3c;color:#fff;text-decoration:none;padding:5px 10px;border-radius:6px;font-size:12px;}";
-  html += "select,input{width:100%;box-sizing:border-box;background:#282828;color:#fff;border:1px solid #444;border-radius:8px;padding:12px;margin-bottom:12px;font-size:15px;}";
-  html += ".btn-green{background:#1DB954;color:#000;font-weight:bold;border:none;border-radius:8px;padding:14px;width:100%;font-size:16px;cursor:pointer;}";
-  html += ".btn-gray{display:block;text-align:center;background:#333;color:#bbb;text-decoration:none;border-radius:8px;padding:12px;font-size:14px;margin-top:8px;}";
-  html += "</style>";
-  html += "<script>";
-  html += "function onSelectNet(sel){";
-  html += "  var c = document.getElementById('custom_box');";
-  html += "  c.style.display = (sel.value === '__custom__') ? 'block' : 'none';";
-  html += "}";
-  html += "</script>";
-  html += "</head><body>";
-
-  html += "<div class='card'>";
-  html += "<h1>📻 Vitrola Jukebox</h1>";
-  html += "<p style='color:#888;font-size:13px;margin:0;'>Gerenciador de Redes Wi-Fi & Nuvem Global</p>";
-  html += "</div>";
-
-  // Card 1: Redes Salvas no Banco
-  html += "<div class='card'>";
-  html += "<h2>💾 Redes Cadastradas no Banco (" + String(arr.size()) + ")</h2>";
-  if (arr.size() == 0) {
-    html += "<p style='color:#777;font-size:13px;'>Nenhuma rede gravada ainda.</p>";
-  } else {
-    for (JsonObject obj : arr) {
-      String s = obj["s"].as<String>();
-      html += "<div class='db-item'>";
-      html += "<span><b>" + s + "</b></span>";
-      html += "<a href='/delete?ssid=" + s + "' class='del-btn' onclick='return confirm(\"Excluir rede " + s + "?\");'>Excluir</a>";
-      html += "</div>";
-    }
-  }
-  html += "</div>";
-
-  // Card 2: Adicionar Nova Rede
-  html += "<div class='card'>";
-  html += "<h2>➕ Adicionar Nova Rede</h2>";
-  html += "<form method='POST' action='/save'>";
-  html += "<label style='font-size:13px;color:#aaa;'>Selecione o Wi-Fi proximo:</label>";
-  html += "<select name='ssid' onchange='onSelectNet(this)' required>";
-  html += "<option value=''>-- Selecione uma rede --</option>";
-  for (int i = 0; i < n; i++) {
-    int rssi = WiFi.RSSI(i);
-    int qual = constrain(2 * (rssi + 100), 0, 100);
-    String enc = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN) ? " (Aberta)" : "";
-    html += "<option value='" + WiFi.SSID(i) + "'>" + WiFi.SSID(i) + " (" + String(qual) + "%" + enc + ")</option>";
-  }
-  html += "<option value='__custom__'>+ Digitar outra rede (Oculta/Manual)</option>";
-  html += "</select>";
-
-  html += "<div id='custom_box' style='display:none;'>";
-  html += "<label style='font-size:13px;color:#aaa;'>Nome da rede oculta (SSID):</label>";
-  html += "<input type='text' name='custom_ssid' placeholder='Ex: MinhaRede'>";
-  html += "</div>";
-
-  html += "<label style='font-size:13px;color:#aaa;'>Senha do Wi-Fi:</label>";
-  html += "<input type='password' name='pass' placeholder='Deixe em branco se for aberta'>";
-
-  html += "<button type='submit' class='btn-green'>💾 Salvar no Banco e Conectar</button>";
-  html += "<a href='/exit' class='btn-gray'>Fechar e Sair</a>";
-  html += "</form>";
-  html += "</div>";
-
-  html += "</body></html>";
-  apServer.send(200, "text/html", html);
+  apServer.send_P(200, "text/html", INDEX_HTML);
 }
 
 void startApMode() {
   if (isApMode) return;
-  Serial.println("\n[WI-FI AP] Iniciando Modo de Ponto de Acesso e Portal Cativo...");
+  Serial.println("\n[WI-FI AP] Iniciando Modo de Ponto de Acesso e Portal de Cadastro...");
   isApMode = true;
   apStartTime = millis();
+
+  // Solicita catalogo atualizado do cartao SD ao CYD
+  SerialCYD.println("{\"cmd\":\"GET_SD_CATALOG\"}");
 
   WiFi.disconnect();
   delay(100);
   WiFi.mode(WIFI_AP_STA);
-  WiFi.softAP("Vitrola-Jukebox-Setup");
+  WiFi.softAP("Jukebox-Setup");
   IPAddress apIP(192, 168, 4, 1);
   WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
 
   dnsServer.start(53, "*", apIP);
 
-  apServer.on("/", handleRoot);
-  apServer.on("/save", HTTP_POST, handleSave);
-  apServer.on("/delete", HTTP_GET, handleDelete);
+  apServer.on("/", HTTP_GET, handleRoot);
+  apServer.on("/api/status", HTTP_GET, handleApiStatus);
+  apServer.on("/api/tracks", HTTP_GET, handleApiTracks);
+  apServer.on("/api/discs", HTTP_GET, handleApiDiscs);
+  apServer.on("/api/save_disc", HTTP_POST, handleApiSaveDisc);
+  apServer.on("/api/delete_disc", HTTP_POST, handleApiDeleteDisc);
+  apServer.on("/api/test_play", HTTP_POST, handleApiTestPlay);
+  apServer.on("/api/save_wifi", HTTP_POST, handleApiSaveWifi);
   apServer.on("/exit", HTTP_GET, handleExit);
 
-  apServer.on("/generate_204", handleRoot);
-  apServer.on("/hotspot-detect.html", handleRoot);
-  apServer.on("/canonical.html", handleRoot);
-  apServer.on("/connecttest.txt", handleRoot);
-  apServer.on("/ncsi.txt", handleRoot);
+  apServer.on("/generate_204", HTTP_GET, handleRoot);
+  apServer.on("/hotspot-detect.html", HTTP_GET, handleRoot);
+  apServer.on("/canonical.html", HTTP_GET, handleRoot);
+  apServer.on("/connecttest.txt", HTTP_GET, handleRoot);
+  apServer.on("/ncsi.txt", HTTP_GET, handleRoot);
   apServer.onNotFound(handleRedirect);
 
   apServer.begin();
@@ -487,7 +503,7 @@ void startApMode() {
   playTone(880.0f, 120, 0.20f);
   delay(150);
   playTone(1320.0f, 180, 0.20f);
-  Serial.printf("[WI-FI AP OK] Rede 'Vitrola-Jukebox-Setup' ativa em %s\n", apIP.toString().c_str());
+  Serial.printf("[WI-FI AP OK] Ponto de Acesso 'Jukebox-Setup' ativo em %s\n", apIP.toString().c_str());
 }
 
 void stopApMode() {
@@ -500,7 +516,8 @@ void stopApMode() {
   WiFi.mode(WIFI_STA);
   sendCydApMode(false);
   reloadWifiMulti();
-  Serial.println("[WI-FI AP OK] Retornando ao modo estacao normal.");
+  playTone(660.0f, 100, 0.15f);
+  Serial.println("[WI-FI AP OK] Retornando ao modo vitrola normal.");
 }
 
 // ==============================================================================
@@ -549,11 +566,11 @@ void setup() {
 
   // 1. Carrega Banco de Dados Permanente de Redes Wi-Fi
   reloadWifiMulti();
-  Serial.println("[REDE] Procurando redes salvas no banco de dados...");
+  Serial.println("[REDE] Verificando redes salvas...");
 
   int tries = 0;
-  while (wifiMulti->run() != WL_CONNECTED && tries < 20) {
-    delay(300);
+  while (wifiMulti->run() != WL_CONNECTED && tries < 6) {
+    delay(250);
     Serial.print(".");
     tries++;
   }
@@ -573,8 +590,9 @@ void setup() {
     // Envia banco sincronizado para a CYD
     sendWifiSyncToCyd();
   } else {
-    Serial.println("\n[REDE ALERTA] Nenhuma rede conhecida encontrada! Entrando no Modo Setup Wi-Fi...");
-    startApMode();
+    Serial.println("\n[MODO OFFLINE] Nenhuma rede Wi-Fi conectada. Vitrola 100% pronta com Cartao MicroSD!");
+    WiFi.mode(WIFI_STA);
+    playTone(880.0f, 100, 0.15f);
   }
 }
 
@@ -656,6 +674,18 @@ void loop() {
           } else if (c == "LOCAL_AUDIO_END") {
             Serial.println("[AUDIO FONTE] >> Fim da faixa do Cartao SD <<");
             isLocalAudioMode = false;
+          } else if (c == "SD_DISCS") {
+            if (doc.containsKey("data")) {
+              sdDiscsDoc.clear();
+              sdDiscsDoc.set(doc["data"]);
+              Serial.println("[S3] Catalogo de discos sincronizado do MicroSD!");
+            }
+          } else if (c == "AP_REQUEST") {
+            Serial.println("[S3] Requisicao de Modo Setup AP recebida do CYD (Touch)");
+            startApMode();
+          } else if (c == "AP_EXIT") {
+            Serial.println("[S3] Requisicao de saida de Modo AP recebida do CYD");
+            stopApMode();
           } else if (c == "PLAYER_TOGGLE") {
             isPlaying = !isPlaying;
             if (isPlaying) {
@@ -695,16 +725,84 @@ void loop() {
     }
   }
 
-  // Se estiver no Modo AP de Configuracao, atende clientes web e DNS
+  // Se estiver no Modo AP de Configuracao, atende clientes web e leitor RFID
   if (isApMode) {
     dnsServer.processNextRequest();
     apServer.handleClient();
+
+    // Verificacao RFID no prato em tempo real para cadastro no portal!
+    if (now - lastRfidCheckTime >= 150) {
+      lastRfidCheckTime = now;
+      if (isDiscPresent) {
+        if (!checkCardPresent(activeUidHex)) {
+          missingChecks++;
+          if (missingChecks >= 3) {
+            byte v = rfid.PCD_ReadRegister(MFRC522::VersionReg);
+            if (v == 0x00 || v == 0xFF) {
+              rfid.PCD_Init();
+              reinitRfidRegisters(MFRC522::RxGain_max);
+            }
+          }
+          if (missingChecks >= 6) {
+            isDiscPresent = false;
+            strncpy(activeUidHex, "NENHUM", sizeof(activeUidHex) - 1);
+            SerialCYD.println("{\"cmd\":\"AP_TAG_UPDATE\",\"uid\":\"\"}");
+          }
+        } else {
+          missingChecks = 0;
+        }
+      } else {
+        byte bufferATQA[2];
+        byte bufferSize = sizeof(bufferATQA);
+        byte st = rfid.PICC_WakeupA(bufferATQA, &bufferSize);
+        if (st != MFRC522::STATUS_OK && st != MFRC522::STATUS_COLLISION) {
+          bufferSize = sizeof(bufferATQA);
+          st = rfid.PICC_RequestA(bufferATQA, &bufferSize);
+        }
+        if (st == MFRC522::STATUS_OK || st == MFRC522::STATUS_COLLISION) {
+          if (rfid.PICC_ReadCardSerial()) {
+            char uidHex[32] = {0};
+            for (byte i = 0; i < rfid.uid.size; i++) {
+              snprintf(uidHex + strlen(uidHex), sizeof(uidHex) - strlen(uidHex), "%02X", rfid.uid.uidByte[i]);
+            }
+            rfid.PCD_StopCrypto1();
+            if (strcmp(activeUidHex, uidHex) != 0) {
+              strncpy(activeUidHex, uidHex, sizeof(activeUidHex) - 1);
+              isDiscPresent = true;
+              missingChecks = 0;
+              Serial.printf("[AP RFID] Tag detectada no prato: %s\n", uidHex);
+              SerialCYD.printf("{\"cmd\":\"AP_TAG_UPDATE\",\"uid\":\"%s\"}\n", uidHex);
+              playTone(1320.0f, 40, 0.12f);
+            }
+          }
+        }
+      }
+    }
+
+    // Playback de audio de teste/preview se disparado no portal
+    uint32_t used = audioRingUsed();
+    if (used > 0) {
+      alignas(4) static int16_t monoIn[PLAY_CHUNK / 2];
+      alignas(4) static int16_t stereoOut[PLAY_CHUNK];
+      uint32_t n = min(used, (uint32_t)PLAY_CHUNK) & ~1u;
+      if (n > 0) {
+        audioRingRead((uint8_t*)monoIn, n);
+        int count = n / 2;
+        int vol = currentVolume;
+        for (int i = 0; i < count; i++) {
+          int16_t sample = (vol < 100) ? (int16_t)(((int32_t)monoIn[i] * vol) / 100) : monoIn[i];
+          stereoOut[i * 2]     = sample;
+          stereoOut[i * 2 + 1] = sample;
+        }
+        i2s.write((const uint8_t*)stereoOut, count * 4);
+      }
+    }
 
     if (now - apStartTime > AP_TIMEOUT_MS) {
       Serial.println("[WI-FI AP] Timeout de inatividade. Encerrando AP...");
       stopApMode();
     }
-    delay(5);
+    delay(2);
     return;
   }
 
@@ -1027,7 +1125,7 @@ void handleDiscPlaced(const char* uidHex) {
   strncpy(activeUidHex, uidHex, sizeof(activeUidHex) - 1);
   isDiscPresent = true;
   isPlaying = true;
-  isLocalAudioMode = false;
+  isLocalAudioMode = true;
   missingChecks = 0;
 
   // 1. NOTIFICACAO INSTANTANEA AO CYD (0 ms! Dispara busca e streaming local no SD imediatamente)
@@ -1039,10 +1137,12 @@ void handleDiscPlaced(const char* uidHex) {
   // 3. Efeito vintage de agulha no sulco
   playNeedleDropEffect();
 
-  // 4. Agenda envio HTTP para o servidor sem congelar o inicio da musica
-  strncpy(pendingDiscUid, uidHex, sizeof(pendingDiscUid) - 1);
-  pendingDiscPlace = true;
-  pendingDiscRemove = false;
+  // 4. Agenda envio HTTP para o servidor sem congelar o inicio da musica (se conectado ao Wi-Fi)
+  if (WiFi.status() == WL_CONNECTED) {
+    strncpy(pendingDiscUid, uidHex, sizeof(pendingDiscUid) - 1);
+    pendingDiscPlace = true;
+    pendingDiscRemove = false;
+  }
 }
 
 void handleDiscRemoved() {
@@ -1058,9 +1158,11 @@ void handleDiscRemoved() {
   playVinylStopEffect();
   stopMotor();
 
-  // 3. Agenda envio de remocao ao servidor
-  pendingDiscRemove = true;
-  pendingDiscPlace = false;
+  // 3. Agenda envio de remocao ao servidor (se conectado ao Wi-Fi)
+  if (WiFi.status() == WL_CONNECTED) {
+    pendingDiscRemove = true;
+    pendingDiscPlace = false;
+  }
 }
 
 // Envia evento para a API (com suporte hibrido LAN vs Nuvem)
@@ -1138,6 +1240,7 @@ void sendCydTelemetry() {
   doc["disc"]    = currentDiscName;
   doc["uid"]     = activeUidHex;
   doc["playing"] = isPlaying;
+  doc["present"] = isDiscPresent;
   doc["vol"]     = currentVolume;
 
   String line;
